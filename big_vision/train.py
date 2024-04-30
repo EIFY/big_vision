@@ -73,7 +73,10 @@ P = jax.sharding.PartitionSpec
 def main(argv):
   del argv
 
-  jax.distributed.initialize()
+  try:
+    jax.distributed.initialize()
+  except ValueError as e:
+    logging.warning('Could not initialize distributed environment: %s', e)
 
   # Make sure TF does not touch GPUs.
   tf.config.set_visible_devices([], "GPU")
@@ -289,20 +292,55 @@ def main(argv):
           u.get_mixup(rng, config.mixup.p),
           mesh=jax.sharding.Mesh(devices_flat, ("data",)),
           in_specs=P("data"), out_specs=(P(), P("data"), P("data")))
-      rng, (images, labels), _ = sharded_mixup_fn(images, labels)
+      rng, (batch["image"], batch["labels"]), _ = sharded_mixup_fn(images, labels)
 
     # Get device-specific loss rng.
     rng, rng_model = jax.random.split(rng, 2)
 
-    def loss_fn(params):
+    def loss_fn(params, minibatch):
+      images, labels = minibatch["image"], minibatch["labels"]
       logits, _ = model.apply(
           {"params": params}, images,
           train=True, rngs={"dropout": rng_model})
       return getattr(u, config.get("loss", "sigmoid_xent"))(
           logits=logits, labels=labels)
 
+    grad_fn = jax.value_and_grad(loss_fn)
     params, opt = train_state["params"], train_state["opt"]
-    loss, grads = jax.value_and_grad(loss_fn)(params)
+
+    batch_size = config.input.batch_size
+    num_minibatches = config.input.accum_freq
+    minibatch_size = batch_size // num_minibatches
+
+    def _minibatch_step(minibatch_idx):
+        """Determine gradients and metrics for a single minibatch."""
+        minibatch = jax.tree_map(
+            lambda x: jax.lax.dynamic_slice_in_dim(  # Slicing with variable index (jax.Array).
+                x, start_index=minibatch_idx * minibatch_size, slice_size=minibatch_size, axis=0
+            ),
+            batch,
+        )
+        step_loss, step_grads = grad_fn(params, minibatch)
+        return step_grads, step_loss
+
+    def _scan_step(carry, minibatch_idx):
+        """Scan step function for looping over minibatches."""
+        step_grads, step_loss = _minibatch_step(minibatch_idx)
+        carry = jax.tree_map(jnp.add, carry, (step_grads, step_loss))
+        return carry, None
+
+    # Determine initial shapes for gradients and metrics.
+    grads_shapes, loss_shape = jax.eval_shape(_minibatch_step, 0)
+    grads = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), grads_shapes)
+    loss = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), loss_shape)
+    # Loop over minibatches to determine gradients and metrics.
+    (grads, loss), _ = jax.lax.scan(
+        _scan_step, init=(grads, loss), xs=jnp.arange(num_minibatches), length=num_minibatches
+    )
+    # Average gradients and loss over minibatches.
+    grads = jax.tree_map(lambda g: g / num_minibatches, grads)
+    loss = loss / num_minibatches
+
     updates, opt = tx.update(grads, opt, params)
     params = optax.apply_updates(params, updates)
 
