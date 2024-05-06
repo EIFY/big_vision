@@ -42,6 +42,7 @@ import numpy as np
 
 import tensorflow.io.gfile as gfile  # pylint: disable=consider-using-from-import
 
+import wandb
 
 Registry = pp_registry.Registry
 
@@ -1244,6 +1245,9 @@ class BigVisionMetricWriter:
     if self.fname:
       self.pool.apply(lambda: None)  # Potentially wait for past writes.
       self.pool.apply_async(write, (self.step_metrics,))
+
+    if wandb.run is not None:
+      wandb.log(self.step_metrics, step=self.step)
 
   def close(self):
     self.step_end()

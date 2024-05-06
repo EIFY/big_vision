@@ -47,6 +47,7 @@ import tensorflow as tf
 
 from tensorflow.io import gfile
 
+import wandb
 
 config_flags.DEFINE_config_file(
     "config", None, "Training configuration.", lock_config=True)
@@ -54,6 +55,8 @@ config_flags.DEFINE_config_file(
 flags.DEFINE_string("workdir", default=None, help="Work unit directory.")
 flags.DEFINE_boolean("cleanup", default=False,
                      help="Delete workdir (only) after successful completion.")
+flags.DEFINE_string("name", default=None, help="Name of the run.")
+
 
 # Adds jax flags to the program.
 jax.config.parse_flags_with_absl()
@@ -121,6 +124,16 @@ def main(argv):
 
   # Allow for things like timings as early as possible!
   u.chrono.inform(measure=mw.measure, write_note=write_note)
+
+  if flags.FLAGS.name:
+    wandb.init(
+      project="mup-vit",
+      name=flags.FLAGS.name,
+      id=flags.FLAGS.name,
+      tags=[],
+      resume='auto',
+      config=vars(config),
+  )
 
 ################################################################################
 #                                                                              #
@@ -344,7 +357,7 @@ def main(argv):
     updates, opt = tx.update(grads, opt, params)
     params = optax.apply_updates(params, updates)
 
-    measurements = {"training_loss": loss}
+    measurements = {"train/loss": loss}
     gs = jax.tree_leaves(bv_optax.replace_frozen(config.schedule, grads, 0.))
     measurements["l2_grads"] = jnp.sqrt(sum([jnp.sum(g * g) for g in gs]))
     ps = jax.tree_leaves(params)
@@ -495,7 +508,7 @@ def main(argv):
       for name, value in measurements.items():
         mw.measure(name, value)
       u.chrono.tick(step)
-      if not np.isfinite(measurements["training_loss"]):
+      if not np.isfinite(measurements["train/loss"]):
         raise RuntimeError(f"The loss became nan or inf somewhere within steps "
                            f"[{step - get_steps('log_training')}, {step}]")
 

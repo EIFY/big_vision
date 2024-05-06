@@ -82,5 +82,5 @@ class Evaluator:
       ncorrect += batch_ncorrect
       loss += batch_losses
       nseen += batch_nseen
-    yield ('prec@1', ncorrect / nseen)
+    yield ('acc@1', ncorrect / nseen)
     yield ('loss', loss / nseen)
