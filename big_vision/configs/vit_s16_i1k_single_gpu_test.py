@@ -45,7 +45,7 @@ def get_config():
       split='train',
   )
   config.input.batch_size = 1024
-  config.input.accum_freq = 8
+  config.input.accum_freq = 4
   config.input.cache_raw = False  # Needs up to 120GB of RAM!
   config.input.shuffle_buffer_size = 150_000
 

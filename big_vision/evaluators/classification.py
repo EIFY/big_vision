@@ -24,36 +24,28 @@ import big_vision.utils as u
 import jax
 import jax.numpy as jnp
 
-
-# Temporary global flag to facilitate backwards compatability. Will be removed
-# by the end of year 2023.
-API = 'jit'
+import torch
+import dlpack
 
 
-# To avoid re-compiling the function for every new instance of the same
-# evaluator on a different dataset!
-@functools.cache
-def get_eval_fn(predict_fn, loss_name):
-  """Produces eval function, also applies pmap."""
-  @jax.jit
-  def _eval_fn(train_state, batch, labels, mask):
-    logits, *_ = predict_fn(train_state, batch)
+def number_correct(output, target, topk=(1,), class_prob=False):
+    """Computes the top-k correct predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        # with e.g. MixUp target is now given by probabilities for each class so we need to convert to class indices
+        if class_prob:
+            _, target = target.topk(1, 1, True, True)
+            target = target.squeeze(dim=1)
 
-    # Ignore the entries with all zero labels for evaluation.
-    mask *= labels.max(axis=1)
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
 
-    loss = getattr(u, loss_name)(
-        logits=logits, labels=labels, reduction=False)
-    loss = jnp.sum(loss * mask)
-
-    top1_idx = jnp.argmax(logits, axis=1)
-    # Extracts the label at the highest logit index for each image.
-    top1_correct = jnp.take_along_axis(
-        labels, top1_idx[:, None], axis=1)[:, 0]
-    ncorrect = jnp.sum(top1_correct * mask)
-    nseen = jnp.sum(mask)
-    return ncorrect, loss, nseen
-  return _eval_fn
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).sum(0, keepdim=True)
+            res.append(correct_k)
+        return res
 
 
 class Evaluator:
@@ -69,18 +61,25 @@ class Evaluator:
         num_ex_per_process=data.num_examples_per_process(),
         cache_final=cache_final, cache_raw=cache_raw)
     self.data_iter = input_pipeline.start_global(self.ds, devices, prefetch)
-    self.eval_fn = get_eval_fn(predict_fn, loss_name)
     self.label_key = label_key
 
-  def run(self, train_state):
+  def run(self, model, criterion, accum_freq):
     """Computes all metrics."""
     ncorrect, loss, nseen = 0, 0, 0
-    for _, batch in zip(range(self.steps), self.data_iter):
-      labels, mask = batch.pop(self.label_key), batch.pop('_mask')
-      batch_ncorrect, batch_losses, batch_nseen = jax.device_get(
-          self.eval_fn(train_state, batch, labels, mask))
-      ncorrect += batch_ncorrect
-      loss += batch_losses
-      nseen += batch_nseen
+    with torch.no_grad():
+      torch.cuda.empty_cache()
+      for _, batch in zip(range(self.steps), self.data_iter):
+        target, mask = batch.pop(self.label_key), batch.pop('_mask')
+        images = batch["image"]
+        images, target = torch.from_dlpack(dlpack.asdlpack(images)), torch.from_dlpack(dlpack.asdlpack(target))
+        images = images.transpose(1, 3).bfloat16()
+
+        for img, trt in zip(images.chunk(accum_freq), target.chunk(accum_freq)):
+            # compute output
+            output = model(img)
+            nseen += img.size(0)
+            loss += criterion(output, trt).item() * img.size(0)
+            ncorrect += number_correct(output, trt, class_prob=True)[0][0].item()
+
     yield ('acc@1', ncorrect / nseen)
     yield ('loss', loss / nseen)

@@ -47,6 +47,10 @@ import tensorflow as tf
 
 from tensorflow.io import gfile
 
+import torch
+import dlpack
+from big_vision.simple_vit import SimpleVisionTransformer
+
 import wandb
 
 config_flags.DEFINE_config_file(
@@ -64,7 +68,7 @@ jax.config.parse_flags_with_absl()
 # a device is transferred implicitly. This often catches subtle bugs that
 # cause slowdowns and memory fragmentation. Explicit transfers are done
 # with jax.device_put and jax.device_get.
-jax.config.update("jax_transfer_guard", "disallow")
+# jax.config.update("jax_transfer_guard", "disallow")
 # Fixes design flaw in jax.random that may cause unnecessary d2d comms.
 jax.config.update("jax_threefry_partitionable", True)
 
@@ -102,7 +106,6 @@ def main(argv):
   save_ckpt_path = None
   if workdir:  # Always create if requested, even if we may not write into it.
     gfile.makedirs(workdir)
-    save_ckpt_path = os.path.join(workdir, "checkpoint.bv")
 
   # The pool is used to perform misc operations such as logging in async way.
   pool = multiprocessing.pool.ThreadPool()
@@ -202,248 +205,56 @@ def main(argv):
 ################################################################################
 
   write_note("Creating model...")
-  model_mod = importlib.import_module(f"big_vision.models.{config.model_name}")
-  model = model_mod.Model(
-      num_classes=config.num_classes, **config.get("model", {}))
 
-  def init(rng):
-    batch = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype.as_numpy_dtype),
-                         train_ds.element_spec)
-    params = model.init(rng, batch["image"])["params"]
+  model = SimpleVisionTransformer(
+        image_size=224,
+        patch_size=16,
+        num_layers=12,
+        num_heads=6,
+        hidden_dim=384,
+        mlp_dim=1536,
+    ).bfloat16().cuda()
 
-    # Set bias in the head to a low value, such that loss is small initially.
-    if "init_head_bias" in config:
-      params["head"]["bias"] = jnp.full_like(params["head"]["bias"],
-                                             config["init_head_bias"])
+  def weight_decay_param(n, p):
+      return p.ndim >= 2 and n.endswith('weight')
 
-    return params
+  wd_params = [p for n, p in model.named_parameters() if weight_decay_param(n, p) and p.requires_grad]
+  non_wd_params = [p for n, p in model.named_parameters() if not weight_decay_param(n, p) and p.requires_grad]
 
-  # This seed makes the Jax part of things (like model init) deterministic.
-  # However, full training still won't be deterministic, for example due to the
-  # tf.data pipeline not being deterministic even if we would set TF seed.
-  # See (internal link) for a fun read on what it takes.
+  criterion = torch.nn.CrossEntropyLoss().cuda()
+  optimizer = torch.optim.AdamW(
+      [
+          {"params": wd_params, "weight_decay": config.wd / config.lr},
+          {"params": non_wd_params, "weight_decay": 0.},
+      ],
+      lr=config.lr,
+  )
+
+  warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1 / config.schedule['warmup_steps'], total_iters=config.schedule['warmup_steps'])
+  cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - config.schedule['warmup_steps'])
+  scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [config.schedule['warmup_steps']])
+
+  original_model = model
+  model = torch.compile(original_model)
+
   rng = jax.random.PRNGKey(u.put_cpu(config.get("seed", 0)))
 
-  write_note("Inferring parameter shapes...")
-  rng, rng_init = jax.random.split(rng)
-  params_shape = jax.eval_shape(init, rng_init)
-
-  write_note("Inferring optimizer state shapes...")
-  tx, sched_fns = bv_optax.make(config, nn.unbox(params_shape), sched_kw=dict(
-      total_steps=total_steps, batch_size=batch_size, data_size=ntrain_img))
-  opt_shape = jax.eval_shape(tx.init, params_shape)
-  # We jit this, such that the arrays are created on the CPU, not device[0].
-  sched_fns_cpu = [u.jit_cpu()(sched_fn) for sched_fn in sched_fns]
-
-  if jax.process_index() == 0:
-    num_params = sum(np.prod(p.shape) for p in jax.tree_leaves(params_shape))
-    mw.measure("num_params", num_params)
-
 ################################################################################
 #                                                                              #
-#                               Shard & Transfer                               #
+#                                 Mix-up Step                                  #
 #                                                                              #
 ################################################################################
 
-  write_note("Creating device mesh...")
-  mesh = jax.sharding.Mesh(device_mesh, mesh_axes)
-  repl_sharding = jax.sharding.NamedSharding(mesh, P())
-
-  write_note("Inferring shardings...")
-  train_state_shape = {"params": params_shape, "opt": opt_shape}
-
-  strategy = config.get("sharding_strategy", [(".*", "replicate")])
-  with nn.logical_axis_rules(sharding_rules):
-    train_state_sharding = bv_sharding.infer_sharding(
-        train_state_shape, strategy=strategy, mesh=mesh)
-
-  write_note("Transferring train_state to devices...")
-  # RNG is always replicated
-  rng_init = u.reshard(rng_init, repl_sharding)
-
-  # Parameters and the optimizer are now global (distributed) jax arrays.
-  params = jax.jit(init, out_shardings=train_state_sharding["params"])(rng_init)
-  opt = jax.jit(tx.init, out_shardings=train_state_sharding["opt"])(params)
-
-  rng, rng_loop = jax.random.split(rng, 2)
-  rng_loop = u.reshard(rng_loop, repl_sharding)
-  del rng  # not used anymore, so delete it.
-
-  # At this point we have everything we need to form a train state. It contains
-  # all the parameters that are passed and updated by the main training step.
-  # From here on, we have no need for Flax AxisMetadata (such as partitioning).
-  train_state = nn.unbox({"params": params, "opt": opt})
-  del params, opt  # Delete to avoid memory leak or accidental reuse.
-
-  write_note("Logging parameter overview...")
-  parameter_overview.log_parameter_overview(
-      train_state["params"], msg="Init params",
-      include_stats="global", jax_logging_process=0)
-
-################################################################################
-#                                                                              #
-#                                 Update Step                                  #
-#                                                                              #
-################################################################################
-
-  @functools.partial(
-      jax.jit,
-      donate_argnums=(0,),
-      out_shardings=(train_state_sharding, repl_sharding))
-  def update_fn(train_state, rng, batch):
-    """Update step."""
-
+  def mixup_fn(step, rng, batch):
     images, labels = batch["image"], batch["labels"]
-
-    step_count = bv_optax.get_count(train_state["opt"], jittable=True)
-    rng = jax.random.fold_in(rng, step_count)
-
-    if config.get("mixup") and config.mixup.p:
-      # The shard_map below makes mixup run on every device independently and
-      # thus avoids unnecessary communication.
-      sharded_mixup_fn = shard_map(
-          u.get_mixup(rng, config.mixup.p),
-          mesh=jax.sharding.Mesh(devices_flat, ("data",)),
-          in_specs=P("data"), out_specs=(P(), P("data"), P("data")))
-      rng, (batch["image"], batch["labels"]), _ = sharded_mixup_fn(images, labels)
-
-    # Get device-specific loss rng.
-    rng, rng_model = jax.random.split(rng, 2)
-
-    def loss_fn(params, minibatch):
-      images, labels = minibatch["image"], minibatch["labels"]
-      logits, _ = model.apply(
-          {"params": params}, images,
-          train=True, rngs={"dropout": rng_model})
-      return getattr(u, config.get("loss", "sigmoid_xent"))(
-          logits=logits, labels=labels)
-
-    grad_fn = jax.value_and_grad(loss_fn)
-    params, opt = train_state["params"], train_state["opt"]
-
-    batch_size = config.input.batch_size
-    num_minibatches = config.input.accum_freq
-    minibatch_size = batch_size // num_minibatches
-
-    def _minibatch_step(minibatch_idx):
-        """Determine gradients and metrics for a single minibatch."""
-        minibatch = jax.tree_map(
-            lambda x: jax.lax.dynamic_slice_in_dim(  # Slicing with variable index (jax.Array).
-                x, start_index=minibatch_idx * minibatch_size, slice_size=minibatch_size, axis=0
-            ),
-            batch,
-        )
-        step_loss, step_grads = grad_fn(params, minibatch)
-        return step_grads, step_loss
-
-    def _scan_step(carry, minibatch_idx):
-        """Scan step function for looping over minibatches."""
-        step_grads, step_loss = _minibatch_step(minibatch_idx)
-        carry = jax.tree_map(jnp.add, carry, (step_grads, step_loss))
-        return carry, None
-
-    # Determine initial shapes for gradients and metrics.
-    grads_shapes, loss_shape = jax.eval_shape(_minibatch_step, 0)
-    grads = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), grads_shapes)
-    loss = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), loss_shape)
-    # Loop over minibatches to determine gradients and metrics.
-    (grads, loss), _ = jax.lax.scan(
-        _scan_step, init=(grads, loss), xs=jnp.arange(num_minibatches), length=num_minibatches
-    )
-    # Average gradients and loss over minibatches.
-    grads = jax.tree_map(lambda g: g / num_minibatches, grads)
-    loss = loss / num_minibatches
-
-    updates, opt = tx.update(grads, opt, params)
-    params = optax.apply_updates(params, updates)
-
-    measurements = {"train/loss": loss}
-    gs = jax.tree_leaves(bv_optax.replace_frozen(config.schedule, grads, 0.))
-    measurements["l2_grads"] = jnp.sqrt(sum([jnp.sum(g * g) for g in gs]))
-    ps = jax.tree_leaves(params)
-    measurements["l2_params"] = jnp.sqrt(sum([jnp.sum(p * p) for p in ps]))
-    us = jax.tree_leaves(updates)
-    measurements["l2_updates"] = jnp.sqrt(sum([jnp.sum(u * u) for u in us]))
-
-    return {"params": params, "opt": opt}, measurements
-
-################################################################################
-#                                                                              #
-#                               Load Checkpoint                                #
-#                                                                              #
-################################################################################
-
-  # Decide how to initialize training. The order is important.
-  # 1. Always resumes from the existing checkpoint, e.g. resumes a finetune job.
-  # 2. Resume from a previous checkpoint, e.g. start a cooldown training job.
-  # 3. Initialize model from something, e,g, start a fine-tuning job.
-  # 4. Train from scratch.
-  resume_ckpt_path = None
-  if save_ckpt_path and gfile.exists(f"{save_ckpt_path}-LAST"):
-    resume_ckpt_path = save_ckpt_path
-  elif config.get("resume"):
-    resume_ckpt_path = fillin(config.resume)
-
-  ckpt_mngr = None
-  if save_ckpt_path or resume_ckpt_path:
-    ckpt_mngr = array_serial.GlobalAsyncCheckpointManager()
-
-  if resume_ckpt_path:
-    write_note(f"Resuming training from checkpoint {resume_ckpt_path}...")
-    jax.tree_map(lambda x: x.delete(), train_state)
-    del train_state
-    shardings = {
-        **train_state_sharding,
-        "chrono": jax.tree_map(lambda _: repl_sharding,
-                               u.chrono.save()),
-    }
-    loaded = u.load_checkpoint_ts(
-        resume_ckpt_path, tree=shardings, shardings=shardings)
-    train_state = {key: loaded[key] for key in train_state_sharding.keys()}
-
-    u.chrono.load(jax.device_get(loaded["chrono"]))
-    del loaded
-  elif config.get("model_init"):
-    write_note(f"Initialize model from {config.model_init}...")
-    # TODO: when updating the `load` API soon, do pass and request the
-    # full `train_state` from it. Examples where useful: VQVAE, BN.
-    train_state["params"] = model_mod.load(
-        train_state["params"], config.model_init, config.get("model"),
-        **config.get("model_load", {}))
-
-    # load has the freedom to return params not correctly sharded. Think of for
-    # example ViT resampling position embedings on CPU as numpy arrays.
-    train_state["params"] = u.reshard(
-        train_state["params"], train_state_sharding["params"])
-
-    parameter_overview.log_parameter_overview(
-        train_state["params"], msg="restored params",
-        include_stats="global", jax_logging_process=0)
-
-
-################################################################################
-#                                                                              #
-#                                 Setup Evals                                  #
-#                                                                              #
-################################################################################
-
-  # We do not jit/pmap this function, because it is passed to evaluator that
-  # does it later. We output as many intermediate tensors as possible for
-  # maximal flexibility. Later `jit` will prune out things that are not needed.
-  def eval_logits_fn(train_state, batch):
-    logits, out = model.apply({"params": train_state["params"]}, batch["image"])
-    return logits, out
-
-  def eval_loss_fn(train_state, batch):
-    logits, _ = model.apply({"params": train_state["params"]}, batch["image"])
-    loss_fn = getattr(u, config.get("loss", "sigmoid_xent"))
-    return {
-        "loss": loss_fn(logits=logits, labels=batch["labels"], reduction=False)
-    }
+    rng = jax.random.fold_in(rng, step)
+    f = u.get_mixup(rng, config.mixup.p)
+    rng, (images, labels), _ = f(images, labels)
+    return rng, images, labels
 
   eval_fns = {
-      "predict": eval_logits_fn,
-      "loss": eval_loss_fn,
+      "predict": None,
+      "loss": None,
   }
 
   # Only initialize evaluators when they are first needed.
@@ -456,10 +267,7 @@ def main(argv):
         devices_flat,
     )
 
-  # At this point we need to know the current step to see whether to run evals.
-  write_note("Inferring the first step number...")
-  first_step_device = bv_optax.get_count(train_state["opt"], jittable=True)
-  first_step = int(jax.device_get(first_step_device))
+  first_step = 0
   u.chrono.inform(first_step=first_step)
 
   # Note that training can be pre-empted during the final evaluation (i.e.
@@ -473,9 +281,8 @@ def main(argv):
         continue
       write_note(f"{name} evaluation...\n{u.chrono.note}")
       with u.chrono.log_timing(f"z/secs/eval/{name}"):
-        with mesh, nn.logical_axis_rules(sharding_rules):
-          for key, value in evaluator.run(train_state):
-            mw.measure(f"{prefix}{key}", value)
+        for key, value in evaluator.run(model, criterion, config.input.accum_freq):
+          mw.measure(f"{prefix}{key}", jax.device_get(value))
 
 ################################################################################
 #                                                                              #
@@ -485,32 +292,48 @@ def main(argv):
 
   prof = None  # Keeps track of start/stop of profiler state.
 
+  def save_checkpoint(state, is_best, path, filename='checkpoint.pth.tar'):
+      filename = os.path.join(path, filename)
+      torch.save(state, filename)
+      if is_best:
+          shutil.copyfile(filename, os.path.join(path, 'model_best.pth.tar'))
+
+  dev = jax.devices('gpu')[0]
+
   write_note("Starting training loop, compiling the first step...")
   for step, batch in zip(range(first_step + 1, total_steps + 1), train_iter):
     mw.step_start(step)
+    rng, images, target = mixup_fn(step, jax.device_put(rng, dev), batch)
 
-    with jax.profiler.StepTraceAnnotation("train_step", step_num=step):
-      with u.chrono.log_timing("z/secs/update0", noop=step > first_step + 1):
-        with mesh, nn.logical_axis_rules(sharding_rules):
-          train_state, measurements = update_fn(train_state, rng_loop, batch)
+    images, target = torch.from_dlpack(dlpack.asdlpack(images)), torch.from_dlpack(dlpack.asdlpack(target))
+    images = images.transpose(1, 3).bfloat16()
 
-    # On the first host, let's always profile a handful of early steps.
-    if jax.process_index() == 0:
-      prof = u.startstop_prof(prof, step, first_step, get_steps("log_training"))
+    minibatch = zip(images.chunk(config.input.accum_freq), target.chunk(config.input.accum_freq))
+    step_loss = 0.0
+
+    for img, trt in minibatch:
+        # compute output
+        output = model(img)
+        loss = criterion(output, trt)
+        step_loss += loss.item()
+
+        # compute gradient
+        (loss / config.input.accum_freq).backward()
+
+    step_loss /= config.input.accum_freq
+    l2_grads = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
+    optimizer.step()
+    optimizer.zero_grad()
 
     # Report training progress
     if (u.itstime(step, get_steps("log_training"), total_steps, host=0)
         or u.chrono.warmup and jax.process_index() == 0):
-      for i, sched_fn_cpu in enumerate(sched_fns_cpu):
-        mw.measure(f"global_schedule{i if i else ''}",
-                   sched_fn_cpu(u.put_cpu(step - 1)))
-      measurements = jax.device_get(measurements)
-      for name, value in measurements.items():
-        mw.measure(name, value)
+      mw.measure("train/loss", step_loss)
+      mw.measure("l2_grads", l2_grads.item())
+      mw.measure("lr", scheduler.get_last_lr()[0])
       u.chrono.tick(step)
-      if not np.isfinite(measurements["train/loss"]):
-        raise RuntimeError(f"The loss became nan or inf somewhere within steps "
-                           f"[{step - get_steps('log_training')}, {step}]")
+
+    scheduler.step()
 
     # Checkpoint saving
     keep_ckpt_steps = get_steps("keep_ckpt", None) or total_steps
@@ -518,31 +341,20 @@ def main(argv):
         (keep := u.itstime(step, keep_ckpt_steps, total_steps, first=False))
         or u.itstime(step, get_steps("ckpt", None), total_steps, first=True)
     ):
-      u.chrono.pause(wait_for=train_state)
-
-      # Copy because we add extra stuff to the checkpoint.
-      ckpt = {**train_state}
-
-      # To save chrono state correctly and safely in a multihost setup, we
-      # broadcast the state to all hosts and convert it to a global array.
-      with jax.transfer_guard("allow"):
-        chrono_ckpt = multihost_utils.broadcast_one_to_all(u.chrono.save())
-      chrono_shardings = jax.tree_map(lambda _: repl_sharding, chrono_ckpt)
-      ckpt = ckpt | {"chrono": u.reshard(chrono_ckpt, chrono_shardings)}
-
-      u.save_checkpoint_ts(ckpt_mngr, ckpt, save_ckpt_path, step, keep)
-      u.chrono.resume()
+      save_checkpoint({
+          'step': step,
+          'state_dict': original_model.state_dict(),
+          'optimizer' : optimizer.state_dict(),
+          'scheduler' : scheduler.state_dict()
+      }, False, flags.FLAGS.workdir)
 
     for (name, evaluator, log_steps, prefix) in evaluators():
       if u.itstime(step, log_steps, total_steps, first=False, last=True):
-        u.chrono.pause(wait_for=train_state)
         u.chrono.tick(step)  # Record things like epoch number, core hours etc.
         write_note(f"{name} evaluation...\n{u.chrono.note}")
         with u.chrono.log_timing(f"z/secs/eval/{name}"):
-          with mesh, nn.logical_axis_rules(sharding_rules):
-            for key, value in evaluator.run(train_state):
-              mw.measure(f"{prefix}{key}", jax.device_get(value))
-        u.chrono.resume()
+          for key, value in evaluator.run(model, criterion, config.input.accum_freq):
+            mw.measure(f"{prefix}{key}", jax.device_get(value))
     mw.step_end()
 
   # Always give a chance to stop the profiler, no matter how things ended.
@@ -556,9 +368,6 @@ def main(argv):
   pool.close()
   pool.join()
   mw.close()
-
-  if ckpt_mngr:
-    ckpt_mngr.wait_until_finished()
 
   # Make sure all hosts stay up until the end of main.
   u.sync()

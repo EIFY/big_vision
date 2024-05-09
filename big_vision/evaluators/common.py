@@ -61,16 +61,6 @@ def from_config(config, predict_fns,
     if devices is not None:
       cfg["devices"] = devices
 
-    api_type = getattr(module, "API", "pmap")
-    if api_type == "pmap" and "devices" in cfg:
-      raise RuntimeError(
-          "You are seemingly using the old pmap-based evaluator, but with "
-          "jit-based train loop, see (internal link) for more details.")
-    if api_type == "jit" and "devices" not in cfg:
-      raise RuntimeError(
-          "You are seemingly using new jit-based evaluator, but with "
-          "old pmap-based train loop, see (internal link) for more details.")
-
     try:
       predict_fn = predict_fns[pred_key]
     except KeyError as e:
