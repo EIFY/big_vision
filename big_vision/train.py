@@ -108,7 +108,6 @@ def main(argv):
       f"{jax.local_device_count()}/{jax.device_count()} devices and "
       f"writing to workdir {workdir}.\u001b[0m")
 
-  save_ckpt_path = None
   if workdir:  # Always create if requested, even if we may not write into it.
     gfile.makedirs(workdir)
 
@@ -355,7 +354,7 @@ def main(argv):
 
     # Checkpoint saving
     keep_ckpt_steps = get_steps("keep_ckpt", None) or total_steps
-    if save_ckpt_path and (
+    if workdir and (
         (keep := u.itstime(step, keep_ckpt_steps, total_steps, first=False))
         or u.itstime(step, get_steps("ckpt", None), total_steps, first=True)
     ):
@@ -364,7 +363,7 @@ def main(argv):
           'state_dict': original_model.state_dict(),
           'optimizer' : optimizer.state_dict(),
           'scheduler' : scheduler.state_dict()
-      }, False, flags.FLAGS.workdir)
+      }, False, workdir)
 
     for (name, evaluator, log_steps, prefix) in evaluators():
       if u.itstime(step, log_steps, total_steps, first=False, last=True):
