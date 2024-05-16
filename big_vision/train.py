@@ -22,6 +22,7 @@ This is a basic variant of a training loop, good starting point for fancy ones.
 import functools
 import importlib
 import multiprocessing.pool
+import math
 import os
 
 from absl import app
@@ -71,6 +72,10 @@ jax.config.parse_flags_with_absl()
 # jax.config.update("jax_transfer_guard", "disallow")
 # Fixes design flaw in jax.random that may cause unnecessary d2d comms.
 jax.config.update("jax_threefry_partitionable", True)
+
+
+# "(...)/python3.10/site-packages/torch/_inductor/compile_fx.py:140: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance."
+torch.set_float32_matmul_precision('high')
 
 
 NamedSharding = jax.sharding.NamedSharding
@@ -213,10 +218,14 @@ def main(argv):
         num_heads=6,
         hidden_dim=384,
         mlp_dim=1536,
-    ).bfloat16().cuda()
+    ).cuda()
 
   def weight_decay_param(n, p):
-      return p.ndim >= 2 and n.endswith('weight')
+    if p.ndim >= 2 and n.endswith('weight'):
+      print('Weight decay for:', n)
+      return True
+    else:
+      return False
 
   wd_params = [p for n, p in model.named_parameters() if weight_decay_param(n, p) and p.requires_grad]
   non_wd_params = [p for n, p in model.named_parameters() if not weight_decay_param(n, p) and p.requires_grad]
@@ -230,7 +239,7 @@ def main(argv):
       lr=config.lr,
   )
 
-  warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1 / config.schedule['warmup_steps'], total_iters=config.schedule['warmup_steps'])
+  warmup = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: step / config.schedule['warmup_steps'])
   cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - config.schedule['warmup_steps'])
   scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [config.schedule['warmup_steps']])
 
@@ -238,6 +247,10 @@ def main(argv):
   model = torch.compile(original_model)
 
   rng = jax.random.PRNGKey(u.put_cpu(config.get("seed", 0)))
+  rng, rng_init = jax.random.split(rng)  # rng_init unused here but we want to keep the pseudorandom numbers the same as the main branch.
+
+  rng, rng_loop = jax.random.split(rng, 2)
+  del rng  # not used anymore, so delete it.
 
 ################################################################################
 #                                                                              #
@@ -250,7 +263,7 @@ def main(argv):
     rng = jax.random.fold_in(rng, step)
     f = u.get_mixup(rng, config.mixup.p)
     rng, (images, labels), _ = f(images, labels)
-    return rng, images, labels
+    return images, labels
 
   eval_fns = {
       "predict": None,
@@ -303,10 +316,10 @@ def main(argv):
   write_note("Starting training loop, compiling the first step...")
   for step, batch in zip(range(first_step + 1, total_steps + 1), train_iter):
     mw.step_start(step)
-    rng, images, target = mixup_fn(step, jax.device_put(rng, dev), batch)
+    images, target = mixup_fn(step, jax.device_put(rng_loop, dev), batch)
 
     images, target = torch.from_dlpack(dlpack.asdlpack(images)), torch.from_dlpack(dlpack.asdlpack(target))
-    images = images.transpose(1, 3).bfloat16()
+    images = images.transpose(1, 3)
 
     minibatch = zip(images.chunk(config.input.accum_freq), target.chunk(config.input.accum_freq))
     step_loss = 0.0
@@ -328,6 +341,11 @@ def main(argv):
     # Report training progress
     if (u.itstime(step, get_steps("log_training"), total_steps, host=0)
         or u.chrono.warmup and jax.process_index() == 0):
+
+      with torch.no_grad():
+        l2_params = sum(p.square().sum().item() for _, p in model.named_parameters())
+        mw.measure("l2_params", math.sqrt(l2_params))
+
       mw.measure("train/loss", step_loss)
       mw.measure("l2_grads", l2_grads.item())
       mw.measure("lr", scheduler.get_last_lr()[0])
