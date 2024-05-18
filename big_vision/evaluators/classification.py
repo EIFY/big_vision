@@ -72,7 +72,7 @@ class Evaluator:
         target, mask = batch.pop(self.label_key), batch.pop('_mask')
         images = batch["image"]
         images, target = torch.from_dlpack(dlpack.asdlpack(images)), torch.from_dlpack(dlpack.asdlpack(target))
-        images = images.transpose(1, 3)
+        images = images.transpose(1, 3).bfloat16()
 
         for img, trt in zip(images.chunk(accum_freq), target.chunk(accum_freq)):
             # compute output

@@ -217,7 +217,7 @@ def main(argv):
         num_heads=6,
         hidden_dim=384,
         mlp_dim=1536,
-    ).cuda()
+    ).bfloat16().cuda()
 
   def weight_decay_param(n, p):
     if p.ndim >= 2 and n.endswith('weight'):
@@ -318,7 +318,7 @@ def main(argv):
     images, target = mixup_fn(step, jax.device_put(rng_loop, dev), batch)
 
     images, target = torch.from_dlpack(dlpack.asdlpack(images)), torch.from_dlpack(dlpack.asdlpack(target))
-    images = images.transpose(1, 3)
+    images = images.transpose(1, 3).bfloat16()
 
     minibatch = zip(images.chunk(config.input.accum_freq), target.chunk(config.input.accum_freq))
     step_loss = 0.0
