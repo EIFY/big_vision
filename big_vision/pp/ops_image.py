@@ -198,7 +198,8 @@ def get_inception_crop(size=None, area_min=5, area_max=100,
 @utils.InKeyOutKey()
 def get_decode_jpeg_and_inception_crop(size=None, area_min=5, area_max=100,
                                        ratio_min=0.75, ratio_max=1.33,
-                                       method="bilinear", antialias=False):
+                                       method="bilinear", antialias=False,
+                                       precise=False):
   """Decode jpeg string and make inception-style image crop.
 
   Inception-style crop is a random image crop (its size and aspect ratio are
@@ -213,6 +214,8 @@ def get_decode_jpeg_and_inception_crop(size=None, area_min=5, area_max=100,
     ratio_max: maximal aspect ratio.
     method: rezied method, see tf.image.resize docs for options.
     antialias: see tf.image.resize. Ideally set to True for all new configs.
+    precise: if False, use default TF image decoding algorithm.
+        If True, change DCT method for JPEG decoding to match PIL/cv2/PyTorch.
 
   Returns:
     A function, that applies inception crop.
@@ -232,7 +235,9 @@ def get_decode_jpeg_and_inception_crop(size=None, area_min=5, area_max=100,
     offset_y, offset_x, _ = tf.unstack(begin)
     target_height, target_width, _ = tf.unstack(crop_size)
     crop_window = tf.stack([offset_y, offset_x, target_height, target_width])
-    image = tf.image.decode_and_crop_jpeg(image_data, crop_window, channels=3)
+    dct_method = "INTEGER_ACCURATE" if precise else ""
+    image = tf.image.decode_and_crop_jpeg(
+        image_data, crop_window, channels=3, dct_method=dct_method)
 
     if size:
       image = get_resize(size, method, antialias)({"image": image})["image"]
