@@ -15,7 +15,7 @@
 # pylint: disable=line-too-long
 r"""Pre-training ViT-S/16 on ILSVRC-2012 following https://arxiv.org/abs/2205.01580.
 
-This should take 6-7h to finish 90ep on a TPU-v3-8 and reach 76.5%,
+This took 5d19h32m to finish 90ep on a GeForce RTX 3080 Laptop GPU and reach 76.8%,
 see the tech report for more details.
 
 Command to run:
@@ -78,7 +78,7 @@ def get_config():
   # Optimizer section
   config.grad_clip_norm = 1.0
   config.optax_name = 'scale_by_adam'
-  config.optax = dict(mu_dtype='bfloat16')
+  config.optax = dict(mu_dtype='float32')
 
   config.lr = 0.001
   config.wd = 0.0001
