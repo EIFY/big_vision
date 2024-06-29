@@ -15,7 +15,7 @@
 # pylint: disable=line-too-long
 r"""Pre-training ViT-S/16 on ILSVRC-2012 following https://arxiv.org/abs/2205.01580.
 
-This took 5d19h32m to finish 90ep on a GeForce RTX 3080 Laptop GPU and reach 76.8%,
+This took 5h41m to finish 90ep on a 8xA100-SXM4-40GB machine and reach 76.9%,
 see the tech report for more details.
 
 Command to run:
