@@ -67,7 +67,6 @@ class Encoder(nn.Module):
 
     def __init__(
         self,
-        seq_length: int,
         num_layers: int,
         num_heads: int,
         hidden_dim: int,
@@ -96,8 +95,21 @@ class Encoder(nn.Module):
         return self.ln(self.layers(self.dropout(input)))
 
 
+def jax_lecun_normal(layer, fan_in):
+    """(re-)initializes layer weight in the same way as jax.nn.initializers.lecun_normal and bias to zero"""
+
+    # constant is stddev of standard normal truncated to (-2, 2)
+    std = math.sqrt(1 / fan_in) / .87962566103423978
+    nn.init.trunc_normal_(layer.weight, std=std, a=-2 * std, b=2 * std)
+    if layer.bias is not None:
+        nn.init.zeros_(layer.bias)
+
+
 class SimpleVisionTransformer(nn.Module):
     """Vision Transformer modified per https://arxiv.org/abs/2205.01580."""
+
+    def _learned_embeddings(self, num):
+        return nn.Parameter(torch.normal(mean=0., std=math.sqrt(1 / self.hidden_dim), size=(1, num, self.hidden_dim)))
 
     def __init__(
         self,
@@ -110,7 +122,10 @@ class SimpleVisionTransformer(nn.Module):
         dropout: float = 0.0,
         attention_dropout: float = 0.0,
         num_classes: int = 1000,
+        posemb: str = "sincos2d",
         representation_size: Optional[int] = None,
+        pool_type: str = "gap",
+        register: int = 0,
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
     ):
         super().__init__()
@@ -123,7 +138,13 @@ class SimpleVisionTransformer(nn.Module):
         self.dropout = dropout
         self.num_classes = num_classes
         self.representation_size = representation_size
+        self.pool_type = pool_type
         self.norm_layer = norm_layer
+        self.register = register + (pool_type == 'tok')  # [CLS] token is just another register
+        if self.register == 1:
+            self.register_buffer("reg", torch.zeros(1, 1, hidden_dim))
+        elif self.register > 1:  # Random initialization needed to break the symmetry
+            self.reg = self._learned_embeddings(self.register)
 
         self.conv_proj = nn.Conv2d(
             in_channels=3, out_channels=hidden_dim, kernel_size=patch_size, stride=patch_size
@@ -131,10 +152,14 @@ class SimpleVisionTransformer(nn.Module):
 
         h = w = image_size // patch_size
         seq_length = h * w
-        self.register_buffer("pos_embedding", posemb_sincos_2d(h=h, w=w, dim=hidden_dim))
+        if posemb == "sincos2d":
+            self.register_buffer("pos_embedding", posemb_sincos_2d(h=h, w=w, dim=hidden_dim))
+        elif posemb == "learn":
+            self.pos_embedding = self._learned_embeddings(seq_length)
+        else:
+            self.pos_embedding = None
 
         self.encoder = Encoder(
-            seq_length,
             num_layers,
             num_heads,
             hidden_dim,
@@ -155,26 +180,13 @@ class SimpleVisionTransformer(nn.Module):
 
         self.heads = nn.Sequential(heads_layers)
 
-        if isinstance(self.conv_proj, nn.Conv2d):
-            # Init the patchify stem
-            fan_in = self.conv_proj.in_channels * self.conv_proj.kernel_size[0] * self.conv_proj.kernel_size[1]
-            # constant is stddev of standard normal truncated to (-2, 2)
-            std = math.sqrt(1 / fan_in) / .87962566103423978
-            nn.init.trunc_normal_(self.conv_proj.weight, std=std, a=-2 * std, b=2 * std)
-            if self.conv_proj.bias is not None:
-                nn.init.zeros_(self.conv_proj.bias)
-        elif self.conv_proj.conv_last is not None and isinstance(self.conv_proj.conv_last, nn.Conv2d):
-            # Init the last 1x1 conv of the conv stem
-            nn.init.normal_(
-                self.conv_proj.conv_last.weight, mean=0.0, std=math.sqrt(2.0 / self.conv_proj.conv_last.out_channels)
-            )
-            if self.conv_proj.conv_last.bias is not None:
-                nn.init.zeros_(self.conv_proj.conv_last.bias)
+        # Init the patchify stem
+        fan_in = self.conv_proj.in_channels * self.conv_proj.kernel_size[0] * self.conv_proj.kernel_size[1] // self.conv_proj.groups
+        jax_lecun_normal(self.conv_proj, fan_in)
 
         if hasattr(self.heads, "pre_logits") and isinstance(self.heads.pre_logits, nn.Linear):
             fan_in = self.heads.pre_logits.in_features
-            nn.init.trunc_normal_(self.heads.pre_logits.weight, std=math.sqrt(1 / fan_in))
-            nn.init.zeros_(self.heads.pre_logits.bias)
+            jax_lecun_normal(self.heads.pre_logits, fan_in)
 
         if isinstance(self.heads.head, nn.Linear):
             nn.init.zeros_(self.heads.head.weight)
@@ -204,9 +216,17 @@ class SimpleVisionTransformer(nn.Module):
     def forward(self, x: torch.Tensor):
         # Reshape and permute the input tensor
         x = self._process_input(x)
-        x = x + self.pos_embedding
+        if self.pos_embedding is not None:
+            x = x + self.pos_embedding
+        if self.register:
+            n = x.shape[0]
+            x = torch.cat([torch.tile(self.reg, (n, 1, 1)), x], dim=1)
         x = self.encoder(x)
-        x = x.mean(dim = 1)
+        if self.pool_type == 'tok':
+            x = x[:, 0]
+        else:
+            x = x[:, self.register:]
+            x = x.mean(dim = 1)
         x = self.heads(x)
 
         return x
