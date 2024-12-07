@@ -28,14 +28,12 @@ import torch
 import dlpack
 
 
-def number_correct(output, target, topk=(1,), class_prob=False):
+def number_correct(output, target, topk=(1,)):
     """Computes the top-k correct predictions for the specified values of k"""
     with torch.no_grad():
         maxk = max(topk)
-        # with e.g. MixUp target is now given by probabilities for each class so we need to convert to class indices
-        if class_prob:
-            _, target = target.topk(1, 1, True, True)
-            target = target.squeeze(dim=1)
+        _, target = target.topk(1, 1, True, True)
+        target = target.squeeze(dim=1)
 
         _, pred = output.topk(maxk, 1, True, True)
         pred = pred.t()
@@ -73,13 +71,20 @@ class Evaluator:
         images = batch["image"]
         images, target = torch.from_dlpack(dlpack.asdlpack(images)), torch.from_dlpack(dlpack.asdlpack(target))
         images = images.transpose(1, 3)
+        mask = torch.from_dlpack(dlpack.asdlpack(mask))
+        # Ignore the entries with all zero labels for evaluation.
+        mask = mask.float() * target.max(dim=1)[0]
+        images = images[mask > 0.]
+        target = target[mask > 0.]
 
         for img, trt in zip(images.chunk(accum_freq), target.chunk(accum_freq)):
             # compute output
             output = model(img)
-            nseen += img.size(0)
-            loss += criterion(output, trt).item() * img.size(0)
-            ncorrect += number_correct(output, trt, class_prob=True)[0][0].item()
+            size = img.size(0)
+            loss += criterion(output, trt).item() * size
+            ncorr = number_correct(output, trt)
+            ncorrect += ncorr[0][0].item()
+            nseen += size
 
     yield ('acc@1', ncorrect / nseen)
     yield ('loss', loss / nseen)
