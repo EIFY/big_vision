@@ -241,6 +241,23 @@ def main(argv):
   warmup = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: step / config.schedule['warmup_steps'])
   cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - config.schedule['warmup_steps'])
   scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [config.schedule['warmup_steps']])
+  first_step = 0
+
+################################################################################
+#                                                                              #
+#                               Load Checkpoint                                #
+#                                                                              #
+################################################################################
+
+  if workdir:
+    filename = os.path.join(workdir, "checkpoint.pth.tar")
+    if os.path.isfile(filename):
+      write_note(f"Resuming training from checkpoint {filename}...")
+      checkpoint = torch.load(filename)
+      model.load_state_dict(checkpoint['state_dict'])
+      optimizer.load_state_dict(checkpoint['optimizer'])
+      scheduler.load_state_dict(checkpoint['scheduler'])
+      first_step = checkpoint['step']
 
   original_model = model
   model = torch.compile(original_model)
@@ -279,7 +296,6 @@ def main(argv):
         devices_flat,
     )
 
-  first_step = 0
   u.chrono.inform(first_step=first_step)
 
   # Note that training can be pre-empted during the final evaluation (i.e.
