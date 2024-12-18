@@ -24,6 +24,7 @@ import importlib
 import multiprocessing.pool
 import math
 import os
+import shutil
 
 from absl import app
 from absl import flags
@@ -242,6 +243,7 @@ def main(argv):
   cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - config.schedule['warmup_steps'])
   scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [config.schedule['warmup_steps']])
   first_step = 0
+  best_acc1 = 0
 
 ################################################################################
 #                                                                              #
@@ -258,6 +260,7 @@ def main(argv):
       optimizer.load_state_dict(checkpoint['optimizer'])
       scheduler.load_state_dict(checkpoint['scheduler'])
       first_step = checkpoint['step']
+      best_acc1 = checkpoint['best_acc1']
 
   original_model = model
   model = torch.compile(original_model)
@@ -310,7 +313,10 @@ def main(argv):
       write_note(f"{name} evaluation...\n{u.chrono.note}")
       with u.chrono.log_timing(f"z/secs/eval/{name}"):
         for key, value in evaluator.run(model, criterion, config.input.accum_freq):
-          mw.measure(f"{prefix}{key}", jax.device_get(value))
+          val = jax.device_get(value)
+          mw.measure(f"{prefix}{key}", val)
+          if key == 'acc@1':
+            acc1 = val
 
 ################################################################################
 #                                                                              #
@@ -334,7 +340,7 @@ def main(argv):
     images, target = mixup_fn(step, jax.device_put(rng_loop, dev), batch)
 
     images, target = torch.from_dlpack(dlpack.asdlpack(images)), torch.from_dlpack(dlpack.asdlpack(target))
-    images = images.transpose(1, 3)
+    images = images.permute(0, 3, 1, 2)
 
     minibatch = zip(images.chunk(config.input.accum_freq), target.chunk(config.input.accum_freq))
     step_loss = 0.0
@@ -368,26 +374,33 @@ def main(argv):
 
     scheduler.step()
 
-    # Checkpoint saving
-    keep_ckpt_steps = get_steps("keep_ckpt", None) or total_steps
-    if workdir and (
-        (keep := u.itstime(step, keep_ckpt_steps, total_steps, first=False))
-        or u.itstime(step, get_steps("ckpt", None), total_steps, first=True)
-    ):
-      save_checkpoint({
-          'step': step,
-          'state_dict': original_model.state_dict(),
-          'optimizer' : optimizer.state_dict(),
-          'scheduler' : scheduler.state_dict()
-      }, False, workdir)
-
     for (name, evaluator, log_steps, prefix) in evaluators():
       if u.itstime(step, log_steps, total_steps, first=False, last=True):
         u.chrono.tick(step)  # Record things like epoch number, core hours etc.
         write_note(f"{name} evaluation...\n{u.chrono.note}")
         with u.chrono.log_timing(f"z/secs/eval/{name}"):
           for key, value in evaluator.run(model, criterion, config.input.accum_freq):
-            mw.measure(f"{prefix}{key}", jax.device_get(value))
+            val = jax.device_get(value)
+            mw.measure(f"{prefix}{key}", val)
+            if key == 'acc@1':
+              acc1 = val
+
+    # Remember the best acc@1 and save checkpoint
+    keep_ckpt_steps = get_steps("keep_ckpt", None) or total_steps
+    if workdir and (
+        (keep := u.itstime(step, keep_ckpt_steps, total_steps, first=False))
+        or u.itstime(step, get_steps("ckpt", None), total_steps, first=True)
+    ):
+      is_best = acc1 > best_acc1
+      best_acc1 = max(acc1, best_acc1)
+      save_checkpoint({
+          'step': step,
+          'state_dict': original_model.state_dict(),
+          'best_acc1': best_acc1,
+          'optimizer' : optimizer.state_dict(),
+          'scheduler' : scheduler.state_dict()
+      }, is_best, workdir)
+
     mw.step_end()
 
   # Always give a chance to stop the profiler, no matter how things ended.

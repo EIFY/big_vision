@@ -70,7 +70,7 @@ class Evaluator:
         target, mask = batch.pop(self.label_key), batch.pop('_mask')
         images = batch["image"]
         images, target = torch.from_dlpack(dlpack.asdlpack(images)), torch.from_dlpack(dlpack.asdlpack(target))
-        images = images.transpose(1, 3)
+        images = images.permute(0, 3, 1, 2)
         mask = torch.from_dlpack(dlpack.asdlpack(mask))
         # Ignore the entries with all zero labels for evaluation.
         mask = mask.float() * target.max(dim=1)[0]
