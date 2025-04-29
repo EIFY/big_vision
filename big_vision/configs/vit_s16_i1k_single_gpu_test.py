@@ -45,7 +45,7 @@ def get_config():
       split='train',
   )
   config.input.batch_size = 1024
-  config.input.accum_freq = 8
+  config.input.accum_freq = 16
   config.input.cache_raw = False  # Needs up to 120GB of RAM!
   config.input.shuffle_buffer_size = 150_000
 
@@ -67,7 +67,7 @@ def get_config():
   config.ckpt_steps = 1000
 
   # Model section
-  config.model_name = 'vit'
+  config.model_name = 'modula_vit'
   config.model = dict(
       variant='S/16',
       rep_size=False,
