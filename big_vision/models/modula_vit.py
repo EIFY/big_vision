@@ -45,14 +45,23 @@ def posemb_sincos_2d(h, w, width, temperature=10_000., dtype=jnp.float32):
   return jnp.asarray(pe, dtype)[None, :, :]
 
 
+def embed_init(key, shape, dtype):
+  weight = jax.random.normal(key, shape=shape, dtype=dtype)
+  return weight / jnp.linalg.norm(weight, axis=-1, keepdims=True) * jnp.sqrt(shape[-1]).astype(dtype)
+
+
 def get_posemb(self, typ, seqshape, width, name, dtype=jnp.float32):
   if typ == "learn":
-    return self.param(name, nn.initializers.normal(stddev=1/np.sqrt(width)),
-                      (1, np.prod(seqshape), width), dtype)
+    return self.param(name, embed_init, (1, np.prod(seqshape), width), dtype)
   elif typ == "sincos2d":
     return posemb_sincos_2d(*seqshape, width, dtype=dtype)
   else:
     raise ValueError(f"Unknown posemb type: {typ}")
+
+
+def kernel_init(key, shape, dtype):
+  fanin, fanout = shape
+  return nn.initializers.orthogonal(scale=jnp.sqrt(fanout / fanin))(key, shape, dtype)
 
 
 class MlpBlock(nn.Module):
@@ -65,8 +74,8 @@ class MlpBlock(nn.Module):
   def __call__(self, x, deterministic=True):
     """Applies Transformer MlpBlock module."""
     inits = dict(
-        kernel_init=nn.initializers.xavier_uniform(),
-        bias_init=nn.initializers.normal(stddev=1e-6),
+        kernel_init=kernel_init,
+        bias_init=nn.initializers.zeros_init(),
     )
 
     d = x.shape[-1]
@@ -94,7 +103,7 @@ class Encoder1DBlock(nn.Module):
     y = nn.LayerNorm()(x)
     y = out["sa"] = nn.MultiHeadDotProductAttention(
         num_heads=self.num_heads,
-        kernel_init=nn.initializers.xavier_uniform(),
+        kernel_init=kernel_init,
         deterministic=deterministic,
         dtype=self.dtype_mm,
         attention_fn=modula_attn.dot_product_attention,
@@ -173,18 +182,24 @@ class MAPHead(nn.Module):
   def __call__(self, x):
     # TODO
     n, l, d = x.shape  # pylint: disable=unused-variable
-    probe = self.param("probe", nn.initializers.xavier_uniform(),
+    probe = self.param("probe", embed_init,
                        (1, 1, d), x.dtype)
     probe = jnp.tile(probe, [n, 1, 1])
 
     x = nn.MultiHeadDotProductAttention(
         num_heads=self.num_heads,
-        kernel_init=nn.initializers.xavier_uniform())(probe, x)
+        kernel_init=kernel_init)(probe, x)
 
     # TODO: dropout on head?
     y = nn.LayerNorm()(x)
     x = x + MlpBlock(mlp_dim=self.mlp_dim)(y)
     return x[:, 0]
+
+
+def conv_init(key, shape, dtype):
+  p1, p2, c, hidden = shape
+  fanin = p1 * p2 * c
+  return nn.initializers.orthogonal(scale=jnp.sqrt(hidden / fanin), column_axis=-1)(key, shape, dtype)
 
 
 class _Model(nn.Module):
@@ -215,7 +230,8 @@ class _Model(nn.Module):
     # Patch extraction
     x = out["stem"] = nn.Conv(
         self.width, self.patch_size, strides=self.patch_size,
-        padding="VALID", name="embedding", dtype=self.dtype_mm)(image)
+        padding="VALID", name="embedding", dtype=self.dtype_mm,
+        kernel_init=conv_init)(image)
 
     n, h, w, c = x.shape
     x = jnp.reshape(x, [n, h * w, c])
@@ -262,7 +278,7 @@ class _Model(nn.Module):
 
     if self.rep_size:
       rep_size = self.width if self.rep_size is True else self.rep_size
-      hid = nn.Dense(rep_size, name="pre_logits")
+      hid = nn.Dense(rep_size, name="pre_logits", kernel_init=kernel_init)
       # NOTE: In the past we did not include tanh in pre_logits.
       # For few-shot, it should not matter much, as it whitens anyways.
       x_2d = nn.tanh(hid(x_2d))
@@ -272,7 +288,7 @@ class _Model(nn.Module):
     out["pre_logits"] = x
 
     if self.num_classes:
-      kw = {"kernel_init": nn.initializers.zeros} if self.head_zeroinit else {}
+      kw = {"kernel_init": nn.initializers.zeros} if self.head_zeroinit else {"kernel_init": kernel_init}
       head = nn.Dense(self.num_classes, name="head", **kw)
       x_2d = out["logits_2d"] = head(x_2d)
       x = out["logits"] = head(x)
