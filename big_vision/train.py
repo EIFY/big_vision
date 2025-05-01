@@ -228,7 +228,8 @@ def main(argv):
   params_shape = jax.eval_shape(init, rng_init)
 
   write_note("Inferring optimizer state shapes...")
-  tx, sched_fns = bv_optax.make(config, nn.unbox(params_shape), sched_kw=dict(
+  tx, sched_fns = bv_optax.make(config, nn.unbox(params_shape),
+      image_shape=train_ds.element_spec["image"].shape, sched_kw=dict(
       total_steps=total_steps, batch_size=batch_size, data_size=ntrain_img))
   opt_shape = jax.eval_shape(tx.init, params_shape)
   # We jit this, such that the arrays are created on the CPU, not device[0].

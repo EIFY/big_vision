@@ -45,7 +45,7 @@ def get_config():
       split='train',
   )
   config.input.batch_size = 1024
-  config.input.accum_freq = 16
+  config.input.accum_freq = 8
   config.input.cache_raw = False  # Needs up to 120GB of RAM!
   config.input.shuffle_buffer_size = 150_000
 
@@ -76,13 +76,13 @@ def get_config():
   )
 
   # Optimizer section
-  config.grad_clip_norm = 1.0
-  config.optax_name = 'scale_by_adam'
-  config.optax = dict(mu_dtype='float32')
+  # You may not need grad-clip or warm-up w/ head_zeroinit (default), removed for now
+  config.optax_name = 'scale_by_momentum_dualize'
+  config.optax = dict(momentum=0.95)
 
-  config.lr = 0.001
+  config.lr = 0.05
   config.wd = 0.0001
-  config.schedule = dict(warmup_steps=10_000, decay_type='cosine')
+  config.schedule = dict(decay_type='cosine')
 
   config.mixup = dict(p=0.2, fold_in=None)
 

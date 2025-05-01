@@ -15,11 +15,12 @@
 """Gradient transformations and other optax utilities."""
 
 import operator
-import big_vision.utils as u
 import jax
 import jax.numpy as jnp
 import optax
 
+import big_vision.utils as u
+from big_vision import dualize
 
 def find_states(opt_state, cls):
   leaves = jax.tree.leaves(
@@ -72,7 +73,7 @@ def clip_by_per_example_global_norm(
   return optax.GradientTransformation(init_fn, update_fn)
 
 
-def make(config, params, *, sched_kw):
+def make(config, params, image_shape, *, sched_kw):
   """Returns gradient transform and learning rate functions."""
 
   # Global schedule. No schedule means frozen.
@@ -107,9 +108,13 @@ def make(config, params, *, sched_kw):
     grad_clip_norm_tx = optax.identity()
 
   # Optimizer updates.
-  tx_func = operator.attrgetter(config.optax_name)(optax)
-  opt_txs = [optax.masked(tx_func(**config.get("optax", {})), not_frozen_mask)]
-  assert "optim" not in config, "Deprecated option, use config.optax."
+  if config.optax_name == 'scale_by_momentum_dualize':
+    assert config.model_name == 'modula_vit'
+    opt_txs = dualize.scale_by_momentum_dualize(config, image_shape)
+  else:
+    tx_func = operator.attrgetter(config.optax_name)(optax)
+    opt_txs = [optax.masked(tx_func(**config.get("optax", {})), not_frozen_mask)]
+    assert "optim" not in config, "Deprecated option, use config.optax."
 
   # Learning rate multipliers. Defaults to 1.0.
   lr_mult_txs = [optax.scale(config.lr)]
