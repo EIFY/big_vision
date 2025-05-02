@@ -55,7 +55,7 @@ def get_config():
       '|keep("image", "labels")'
   )
   config.input.pp = (
-      'decode_jpeg_and_inception_crop(224, method="bilinear", antialias=True, precise=True)|flip_lr|randaug(2,10)' +
+      'decode_jpeg_and_inception_crop(224, area_min=20, method="bilinear", antialias=True, precise=True)|flip_lr|randaug(2,10)' +
       pp_common.format(lbl='label')
   )
   pp_eval = 'decode(precise=True)|resize_small(256, method="bilinear", antialias=True)|central_crop(224)' + pp_common
