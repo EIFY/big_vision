@@ -81,7 +81,7 @@ def get_config():
   config.optax = dict(momentum=0.95)
 
   config.lr = 0.05
-  config.wd = 0.0001
+  config.wd = 0.005
   config.schedule = dict(decay_type='cosine')
 
   config.mixup = dict(p=0.2, fold_in=None)
